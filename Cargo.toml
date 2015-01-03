@@ -1,5 +1,5 @@
 [package]
 
-name = "unrolled-rs"
+name = "unrolled"
 version = "0.0.1"
 authors = ["Sam Ward <github@ward.io>"]
