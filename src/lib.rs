@@ -12,7 +12,7 @@ macro_rules! PAGE_SIZE { () => { 512us } }
 
 /// An Unrolled Linked List.
 /// Removing an item from the middle of the list will move the last item to that position, preventing fragmentation.
-pub struct Unrolled<'a, T: Copy + Show + 'a> {
+pub struct Unrolled<T: Copy + Show> {
 	dlist: DList<Page<T>>,
 	len:   usize, // FIXME could be atomic for thread safety?
 }
@@ -29,8 +29,8 @@ impl<T> Page<T> {
 	}
 }
 
-impl<'a, T: Copy + Show> Unrolled<'a, T> {
-	pub fn new() -> Unrolled<'a, T> {
+impl<'a, T: Copy + Show> Unrolled<T> {
+	pub fn new() -> Unrolled<T> {
 		Unrolled {
 			dlist: DList::new(), // No pages are pre-allocated
 			len:   0,
