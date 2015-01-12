@@ -1,21 +1,20 @@
-#![feature(macro_rules)]
-#![feature(phase)] // For log module
-#![feature(slicing_syntax)]
-
-#[phase(plugin, link)] extern crate log;
+extern crate log;
 
 use std::collections::DList;
+use std::mem::swap;
+use std::fmt::Show; // FIXME debug only
 
 // Dependencies for Slice
 // use std::ops::Slice;
 // use std::rc::Rc;
 
-macro_rules! PAGE_SIZE { () => { 512u } }
+macro_rules! PAGE_SIZE { () => { 512us } }
 
 /// An Unrolled Linked List.
-pub struct Unrolled<'a, T: 'a> {
+/// Removing an item from the middle of the list will move the last item to that position, preventing fragmentation.
+pub struct Unrolled<'a, T: Copy + Show + 'a> {
 	dlist: DList<Page<T>>,
-	len:   uint, // FIXME could be atomic for thread safety?
+	len:   usize, // FIXME could be atomic for thread safety?
 }
 
 struct Page<T> {
@@ -30,7 +29,7 @@ impl<T> Page<T> {
 	}
 }
 
-impl<'a, T> Unrolled<'a, T> {
+impl<'a, T: Copy + Show> Unrolled<'a, T> {
 	pub fn new() -> Unrolled<'a, T> {
 		Unrolled {
 			dlist: DList::new(), // No pages are pre-allocated
@@ -41,82 +40,106 @@ impl<'a, T> Unrolled<'a, T> {
 	/// Insert an item at the end of the list.
 	pub fn push(&mut self, item: T) {
 		// Make sure there's enough space for the item
-		if !self.enough_pages_for(self.len) {
+		if !self.enough_pages_for(self.len + 1) {
 			self.dlist.push_back(Page::new());
-			debug!("Allocating page. dlist.len() == {}", self.dlist.len());
 		};
 
 		self.len += 1;
 
-		debug!("Pushing to list. last_page_len={}", self.dlist.back().unwrap().items.len());
-
 		self.dlist.back_mut().unwrap().items.push(item);
-
-		debug!("Pushed to list. last_page_len={}", self.dlist.back().unwrap().items.len());
 	}
 
 	/// Remove an item from the end of the list and return it.
 	/// Returns None if the list is empty.
 	pub fn pop(&mut self) -> Option<T> {
-		// Cases:
-		// 1) pop off last vec, 1 or 0 extra vecs, done.
-		// 2) pop off last vec, 2 extra vecs, remove last vec, done.
-		// 3) last vec empty, pop off next to last vec, done.
-		let last_page_count = self.dlist.back().unwrap().items.len();
+		if self.len == 0 {
+			return None;
+		}
 
-		debug!("Before pop. num_pages={} last_page_count={}", self.dlist.len(), self.dlist.back().unwrap().items.len());
-
-		let item = match last_page_count == 0 {
-			true => {
-				debug!("Extra last page");
-
-				self.dlist.rotate_forward();
-				let item = self.dlist.back_mut().unwrap().items.pop();
-				self.dlist.rotate_backward();
-				item
+		match self.dlist.iter_mut().nth(page_of(self.len)).unwrap().items.pop() {
+			Some(item) => {
+				self.len -= 1;
+				Some(item)
 			},
-			false => self.dlist.back_mut().unwrap().items.pop()
-		};
-
-		let last_two_pages_empty = self.dlist.len() - page_of(self.len) == 3;
-
-		if last_two_pages_empty {
-			self.dlist.pop_back();
+			None => None,
 		}
-
-		debug!("After pop. num_pages={} last_page_count={}", self.dlist.len(), self.dlist.back().unwrap().items.len());
-
-		match item {
-			Some(_) => self.len -= 1,
-			None    => {},
-		}
-
-		item
 	}
 
-	pub fn len(&self) -> uint {
+	pub fn len(&self) -> usize {
 		self.len
+	}
+
+	pub fn ref_mut(&mut self, pos: usize) -> &mut T {
+		self.dlist.iter_mut().nth(page_of(pos)).unwrap().items.as_mut_slice().get_mut(pos % PAGE_SIZE!()).unwrap()
+	}
+
+	fn mut_slice_pages(&'a mut self) -> Vec<&'a mut[T]> {
+		let mut slices: Vec<&mut[T]> = Vec::new();
+
+		for p in self.dlist.iter_mut() {
+			slices.push((*p.items).as_mut_slice());
+		}
+
+		slices
+	}
+
+	/// Removes and returns the item at a given position.
+	/// Returns None if no item exists at that position.
+	pub fn remove(&mut self, pos: usize) -> Option<T> {
+		// What I want to write...
+		let max_idx = self.len - 1;
+
+		if pos > max_idx || self.len == 0 {
+			return None;
+		}
+
+		// Swap with last, unless it's last
+		if pos != max_idx {
+			let mut pages = self.mut_slice_pages();
+			let item_offset = pos % PAGE_SIZE!();
+			let last_offset = max_idx % PAGE_SIZE!();
+
+			// Check if it's on the last page
+			if page_of(pos) != page_of(max_idx) {
+				let (item_page, last_page) = pages.as_mut_slice().split_at_mut(page_of(max_idx));
+
+				swap(
+					item_page.get_mut(item_offset).unwrap(),
+					last_page.get_mut(last_offset).unwrap()
+				);
+			} else {
+				let (item, last) = pages[page_of(pos)].split_at_mut(last_offset);
+				let item_len = item.len();
+
+				swap(
+					item.get_mut(item_offset).unwrap(),
+					last.get_mut(last_offset - item_len).unwrap()
+				);
+			}
+		}
+
+		self.pop()
 	}
 
 	// Check if enough pages exist to hold a given index
 	#[inline]
-	fn enough_pages_for(&self, pos: uint) -> bool {
+	fn enough_pages_for(&self, pos: usize) -> bool {
 		match self.dlist.len() {
 			0 => false,
-			_ => page_of(pos) <= self.dlist.len() * PAGE_SIZE!(),
+			_ => page_of(pos) <= self.dlist.len() - 1,
 		}
 	}
 }
 
 // Returns the zero-indexed page that a zero-indexed item is on
 #[inline]
-fn page_of(pos: uint) -> uint {
+fn page_of(pos: usize) -> usize {
 	pos / PAGE_SIZE!()
 }
 
 /*
 FIXME huon might implement reference counted slicing, which would make Slice much easier to implement here
-impl<'c, T> Slice<uint, [&'c [T]]> for Unrolled<'c, T> {
+impl<'c, T> Slice<usize, [&'c [T]]> for Unrolled<'c, T> {
     fn as_slice_<'a>(&'a self) -> &'a [&'c [T]] {
 		let v: Vec<&'c [T]> = self.dlist
 			.iter()
@@ -127,7 +150,7 @@ impl<'c, T> Slice<uint, [&'c [T]]> for Unrolled<'c, T> {
 		Rc::new(v).as_slice()
 	}
 
-    fn slice_from_or_fail<'a>(&'a self, from: &uint) -> &'a [&'c [T]] {
+    fn slice_from_or_fail<'a>(&'a self, from: &usize) -> &'a [&'c [T]] {
 		let v: Vec<&'c [T]> = self.dlist
 			.iter()
 			.by_ref()
@@ -143,7 +166,7 @@ impl<'c, T> Slice<uint, [&'c [T]]> for Unrolled<'c, T> {
 		slice
 	}
 
-    fn slice_to_or_fail<'a>(&'a self, to: &uint) -> &'a [&'c [T]] {
+    fn slice_to_or_fail<'a>(&'a self, to: &usize) -> &'a [&'c [T]] {
 		let v: Vec<&'c [T]> = self.dlist
 			.iter()
 			.by_ref()
@@ -161,7 +184,7 @@ impl<'c, T> Slice<uint, [&'c [T]]> for Unrolled<'c, T> {
 		slice
 	}
 
-    fn slice_or_fail<'a>(&'a self, from: &uint, to: &uint) -> &'a [&'c [T]] {
+    fn slice_or_fail<'a>(&'a self, from: &usize, to: &usize) -> &'a [&'c [T]] {
 		let diff = *to - *from;
 
 		let v: Vec<&'c [T]> = self.dlist
@@ -202,30 +225,49 @@ mod tests {
 
 	#[test]
 	fn smoke_push_pop() {
-		let mut list: Unrolled<int> = Unrolled::new();
+		let mut list: Unrolled<i32> = Unrolled::new();
 
 		assert!(list.dlist.len() == 0);
 
-		let psize: int = PAGE_SIZE!() as int;
+		let psize: i32 = PAGE_SIZE!() as i32;
 
-		for n in 0i..(3*psize) {
+		println!("Pushing...");
+
+		for n in 0i32..(3*psize) {
 			println!("Push {}. real_len={} expected_len={}", n, list.len(), n);
-			assert!(list.len() == n as uint);
+			assert!(list.len() == n as usize);
 			list.push(n);
 		}
 
-		for n in range_step(3i*psize - 1, -1, -1) {
+		println!("Popping non-empty...");
+
+		for n in range_step(3i32*psize - 1, -1, -1) {
 			let pop = list.pop().unwrap();
 			println!("Pop {} received {}.  real_len={} expected_len={}", n, pop, list.len(), n);
-			assert!(list.len() == n as uint);
+			assert!(list.len() == n as usize);
 			assert!(pop == n);
 		}
 
-		for _ in 0i..(3*psize) {
+		println!("Popping empty...");
+
+		for _ in 0i32..(3*psize) {
 			let pop = list.pop();
-			println!("Pop on empty list expects None, received {}", pop);
+			println!("Pop on empty list expects None, received {:?}", pop);
 			assert!(pop == None);
 			assert!(list.len() == 0);
 		}
+	}
+
+	#[test]
+	fn smoke_remove() {
+		let mut list: Unrolled<i32> = Unrolled::new();
+		list.push(1);
+		list.push(2);
+		assert!(list.remove(0) == Some(1));
+		println!("Removed 1");
+		assert!(list.remove(0) == Some(2));
+		println!("Removed 2");
+		assert!(list.remove(0) == None);
+		println!("Removed None");
 	}
 }
