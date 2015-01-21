@@ -13,6 +13,7 @@ macro_rules! PAGE_SIZE { () => { 512us } }
 /// An Unrolled Linked List.
 /// Removing an item from the middle of the list will move the last item to that position, preventing fragmentation.
 pub struct Unrolled<T: Copy + Show> {
+	psize: usize,
 	dlist: DList<Page<T>>,
 	len:   usize, // FIXME could be atomic for thread safety?
 }
@@ -22,16 +23,17 @@ struct Page<T> {
 }
 
 impl<T> Page<T> {
-	fn new() -> Page<T> {
+	fn new(psize: usize) -> Page<T> {
 		Page{
-			items: Vec::with_capacity(PAGE_SIZE!()),
+			items: Vec::with_capacity(psize),
 		}
 	}
 }
 
 impl<'a, T: Copy + Show> Unrolled<T> {
-	pub fn new() -> Unrolled<T> {
+	pub fn new(page_size: usize) -> Unrolled<T> {
 		Unrolled {
+			psize: page_size,
 			dlist: DList::new(), // No pages are pre-allocated
 			len:   0,
 		}
@@ -41,7 +43,7 @@ impl<'a, T: Copy + Show> Unrolled<T> {
 	pub fn push(&mut self, item: T) {
 		// Make sure there's enough space for the item
 		if !self.enough_pages_for(self.len + 1) {
-			self.dlist.push_back(Page::new());
+			self.dlist.push_back(Page::new(self.psize));
 		};
 
 		self.len += 1;
@@ -56,7 +58,8 @@ impl<'a, T: Copy + Show> Unrolled<T> {
 			return None;
 		}
 
-		match self.dlist.iter_mut().nth(page_of(self.len)).unwrap().items.pop() {
+		let page = self.page_of(self.len);
+		match self.dlist.iter_mut().nth(page).unwrap().items.pop() {
 			Some(item) => {
 				self.len -= 1;
 				Some(item)
@@ -69,18 +72,13 @@ impl<'a, T: Copy + Show> Unrolled<T> {
 		self.len
 	}
 
-	pub fn ref_mut(&mut self, pos: usize) -> &mut T {
-		self.dlist.iter_mut().nth(page_of(pos)).unwrap().items.as_mut_slice().get_mut(pos % PAGE_SIZE!()).unwrap()
+	pub fn get_mut(&mut self, pos: usize) -> Option<&mut T> {
+		let page = self.page_of(pos);
+		self.dlist.iter_mut().nth(page).unwrap().items.as_mut_slice().get_mut(pos % self.psize)
 	}
 
-	fn mut_slice_pages(&'a mut self) -> Vec<&'a mut[T]> {
-		let mut slices: Vec<&mut[T]> = Vec::new();
-
-		for p in self.dlist.iter_mut() {
-			slices.push((*p.items).as_mut_slice());
-		}
-
-		slices
+	pub fn get(&self, pos: usize) -> Option<&T> {
+		self.dlist.iter().nth(self.page_of(pos)).unwrap().items.as_slice().get(pos % self.psize)
 	}
 
 	/// Removes and returns the item at a given position.
@@ -95,20 +93,23 @@ impl<'a, T: Copy + Show> Unrolled<T> {
 
 		// Swap with last, unless it's last
 		if pos != max_idx {
+			let item_offset = pos % self.psize;
+			let last_offset = max_idx % self.psize;
+			let page_pos = self.page_of(pos);
+			let page_max = self.page_of(max_idx);
+
 			let mut pages = self.mut_slice_pages();
-			let item_offset = pos % PAGE_SIZE!();
-			let last_offset = max_idx % PAGE_SIZE!();
 
 			// Check if it's on the last page
-			if page_of(pos) != page_of(max_idx) {
-				let (item_page, last_page) = pages.as_mut_slice().split_at_mut(page_of(max_idx));
+			if page_pos != page_max {
+				let (item_page, last_page) = pages.as_mut_slice().split_at_mut(page_max);
 
 				swap(
 					item_page.get_mut(item_offset).unwrap(),
 					last_page.get_mut(last_offset).unwrap()
 				);
 			} else {
-				let (item, last) = pages[page_of(pos)].split_at_mut(last_offset);
+				let (item, last) = pages[page_pos].split_at_mut(last_offset);
 				let item_len = item.len();
 
 				swap(
@@ -121,20 +122,29 @@ impl<'a, T: Copy + Show> Unrolled<T> {
 		self.pop()
 	}
 
+	fn mut_slice_pages(&'a mut self) -> Vec<&'a mut[T]> {
+		let mut slices: Vec<&mut[T]> = Vec::new();
+
+		for p in self.dlist.iter_mut() {
+			slices.push((*p.items).as_mut_slice());
+		}
+
+		slices
+	}
+
 	// Check if enough pages exist to hold a given index
 	#[inline]
 	fn enough_pages_for(&self, pos: usize) -> bool {
 		match self.dlist.len() {
 			0 => false,
-			_ => page_of(pos) <= self.dlist.len() - 1,
+			_ => self.page_of(pos) <= self.dlist.len() - 1,
 		}
 	}
-}
 
-// Returns the zero-indexed page that a zero-indexed item is on
-#[inline]
-fn page_of(pos: usize) -> usize {
-	pos / PAGE_SIZE!()
+	// Returns the zero-indexed page that a zero-indexed item is on
+	pub fn page_of(&self, pos: usize) -> usize {
+		pos / self.psize
+	}
 }
 
 /*
@@ -211,25 +221,28 @@ impl<'c, T> Slice<usize, [&'c [T]]> for Unrolled<'c, T> {
 #[cfg(test)]
 mod tests {
 	use std::iter::range_step;
-	use super::{Unrolled, page_of};
+	use super::Unrolled;
 
 	#[test]
 	fn utilities() {
-		assert!(page_of(0) == 0);
-		assert!(page_of(1) == 0);
-		assert!(page_of(PAGE_SIZE!()) == 1);
-		assert!(page_of(PAGE_SIZE!() - 1) == 0);
-		assert!(page_of(PAGE_SIZE!() * 2) == 2);
-		assert!(page_of(PAGE_SIZE!() * 2 + 1) == 2);
+		let psize = 10us;
+		let list: Unrolled<usize> = Unrolled::new(psize);
+		assert!(list.page_of(0) == 0);
+		assert!(list.page_of(1) == 0);
+		assert!(list.page_of(psize) == 1);
+		assert!(list.page_of(psize - 1) == 0);
+		assert!(list.page_of(psize * 2) == 2);
+		assert!(list.page_of(psize * 2 + 1) == 2);
 	}
 
 	#[test]
 	fn smoke_push_pop() {
-		let mut list: Unrolled<i32> = Unrolled::new();
+		let psize = 10us;
+		let mut list: Unrolled<i32> = Unrolled::new(psize);
 
 		assert!(list.dlist.len() == 0);
 
-		let psize: i32 = PAGE_SIZE!() as i32;
+		let psize: i32 = psize as i32;
 
 		println!("Pushing...");
 
@@ -260,7 +273,7 @@ mod tests {
 
 	#[test]
 	fn smoke_remove() {
-		let mut list: Unrolled<i32> = Unrolled::new();
+		let mut list: Unrolled<i32> = Unrolled::new(10us);
 		list.push(1);
 		list.push(2);
 		assert!(list.remove(0) == Some(1));
