@@ -2,7 +2,6 @@ extern crate log;
 
 use std::collections::DList;
 use std::mem::swap;
-use std::fmt::Show; // FIXME debug only
 
 // Dependencies for Slice
 // use std::ops::Slice;
@@ -12,7 +11,7 @@ macro_rules! PAGE_SIZE { () => { 512us } }
 
 /// An Unrolled Linked List.
 /// Removing an item from the middle of the list will move the last item to that position, preventing fragmentation.
-pub struct Unrolled<T: Copy + Show> {
+pub struct Unrolled<T> {
 	psize: usize,
 	dlist: DList<Page<T>>,
 	len:   usize, // FIXME could be atomic for thread safety?
@@ -30,7 +29,7 @@ impl<T> Page<T> {
 	}
 }
 
-impl<'a, T: Copy + Show> Unrolled<T> {
+impl<'a, T> Unrolled<T> {
 	pub fn new(page_size: usize) -> Unrolled<T> {
 		Unrolled {
 			psize: page_size,
